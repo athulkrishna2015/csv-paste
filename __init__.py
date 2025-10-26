@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 CSV Paste Import Add-on for Anki
-Allows direct pasting of CSV content with automatic delimiter detection
+Allows direct pasting of CSV content with automatic delimiter and note-type detection,
+and quick creation of a subdeck under the selected target deck.
 """
 
 from aqt import mw, gui_hooks
 from aqt.qt import (
     QAction, QCheckBox, QComboBox, QDialog, QFormLayout, QGroupBox, QLabel,
-    QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout
+    QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout, QLineEdit, QWidget
 )
 from aqt.utils import showInfo, showWarning
 from aqt.importing import importFile
+
 import csv
 import io
 import os
+import re
 import tempfile
 
 
@@ -36,30 +39,34 @@ class CSVPasteDialog(QDialog):
             "2. Optional: check 'First row is header'<br>"
             "3. Choose deck and note type<br>"
             "4. Click 'Quick Import' (direct) or 'Import with Anki dialog' (full UI)<br><br>"
-            "<b>Supported delimiters:</b> comma, tab, semicolon, pipe"
+            "<b>Supported delimiters:</b> comma, tab, semicolon, pipe<br>"
+            "<b>Directives:</b> #notetype:Basic or #notetype:Cloze on top"
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
 
+        # CSV area
         layout.addWidget(QLabel("CSV Content:"))
         self.csv_text = QPlainTextEdit()
         self.csv_text.setPlaceholderText(
             "Paste CSV here...\n\n"
-            "Examples:\n"
-            "What is the capital of France?,Paris,geography\n"
+            "#notetype:Basic\n"
+            "Front,Back,Tags\n"
             "What is 2+2?,4,math\n\n"
-            "OR with tabs:\n"
-            "Front\tBack\tTags\n"
-            "Question\tAnswer\ttag1"
+            "Or:\n"
+            "#notetype:Cloze\n"
+            "Text,Extra,Tags\n"
+            "{{c1::Humans}} landed on the moon in {{c1::1969}}.,,space"
         )
         self.csv_text.textChanged.connect(self.on_text_changed)
         layout.addWidget(self.csv_text)
 
-        # Detection status
+        # Status
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #21808D; font-weight: 500;")
         layout.addWidget(self.status_label)
 
+        # Settings group
         settings_group = QGroupBox("Import Settings")
         settings_layout = QFormLayout()
 
@@ -71,7 +78,7 @@ class CSVPasteDialog(QDialog):
             self.deck_infos = []
         self.deck_combo.addItems([d.name for d in self.deck_infos])
 
-        # Default: current deck
+        # Default current deck
         try:
             cur = mw.col.decks.current()
             try:
@@ -85,6 +92,23 @@ class CSVPasteDialog(QDialog):
             pass
         settings_layout.addRow("Target Deck:", self.deck_combo)
 
+        # Add Subdeck row: use QWidget container (not QGroupBox) so it never auto-disables
+        subdeck_container = QWidget(self)
+        subdeck_row = QHBoxLayout(subdeck_container)
+        self.new_subdeck_edit = QLineEdit()
+        self.new_subdeck_edit.setPlaceholderText("New subdeck name (e.g., Lesson 1)")
+        self.create_subdeck_btn = QPushButton("Create subdeck")
+        self.create_subdeck_btn.clicked.connect(self.create_subdeck)
+        subdeck_row.addWidget(self.new_subdeck_edit)
+        subdeck_row.addWidget(self.create_subdeck_btn)
+        subdeck_container.setEnabled(True)
+        # Enable only when at least one deck exists
+        subdeck_container.setEnabled(self.deck_combo.count() > 0)
+        self.deck_combo.currentIndexChanged.connect(
+            lambda _: subdeck_container.setEnabled(self.deck_combo.count() > 0)
+        )
+        settings_layout.addRow("Add Subdeck:", subdeck_container)
+
         # Note types
         self.notetype_combo = QComboBox()
         try:
@@ -94,7 +118,7 @@ class CSVPasteDialog(QDialog):
         self.notetype_combo.addItems([m.name for m in self.model_infos])
         settings_layout.addRow("Note Type:", self.notetype_combo)
 
-        # Delimiter selection (now with Auto option)
+        # Delimiter selection
         self.delimiter_combo = QComboBox()
         self.delimiter_combo.addItems([
             "Auto-detect",
@@ -103,11 +127,13 @@ class CSVPasteDialog(QDialog):
             "Semicolon (;)",
             "Pipe (|)"
         ])
-        self.delimiter_combo.setCurrentIndex(0)  # Default to auto-detect
+        self.delimiter_combo.setCurrentIndex(0)
+        self.delimiter_combo.currentIndexChanged.connect(self.on_text_changed)
         settings_layout.addRow("Delimiter:", self.delimiter_combo)
 
         # Header checkbox
         self.header_check = QCheckBox("First row is header")
+        self.header_check.toggled.connect(self.on_text_changed)
         settings_layout.addRow("", self.header_check)
 
         settings_group.setLayout(settings_layout)
@@ -115,100 +141,170 @@ class CSVPasteDialog(QDialog):
 
         # Buttons
         btns = QHBoxLayout()
-        
-        # Quick import button (direct import)
         self.import_btn = QPushButton("Quick Import")
         self.import_btn.clicked.connect(self.do_import)
         self.import_btn.setDefault(True)
-        
-        # Anki dialog button (use standard import UI)
+
         self.import_anki_btn = QPushButton("Import with Anki dialog")
         self.import_anki_btn.clicked.connect(self.open_with_default_importer)
-        
+
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        
+
         btns.addStretch()
         btns.addWidget(self.import_btn)
         btns.addWidget(self.import_anki_btn)
         btns.addWidget(cancel_btn)
-        
+
         layout.addLayout(btns)
         self.setLayout(layout)
 
+    # -------------------- Directive parsing --------------------
+
+    def extract_directives(self, content: str) -> dict:
+        """
+        Parse leading lines like '#key:value' before the first non-empty, non-# line.
+        """
+        directives = {}
+        for line in content.splitlines():
+            if not line.strip():
+                continue
+            if not line.lstrip().startswith("#"):
+                break
+            m = re.match(r"^\s*#\s*([A-Za-z0-9_\-]+)\s*:\s*(.+?)\s*$", line)
+            if m:
+                directives[m.group(1).lower()] = m.group(2)
+        return directives
+
+    def strip_directive_lines(self, content: str) -> str:
+        out = []
+        skipping = True
+        for line in content.splitlines():
+            if skipping and line.strip().startswith("#"):
+                continue
+            skipping = skipping and not line.strip()
+            if not skipping:
+                out.append(line)
+        return "\n".join(out)
+
+    def find_model_index_by_name(self, name: str):
+        if not name:
+            return None
+        target = name.strip().lower()
+        # Allow common aliases
+        alias_map = {
+            "cloze": "cloze",
+            "basic": "basic",
+            "basic (and reversed card)": "basic (and reversed card)",
+            "basic (type in the answer)": "basic (type in the answer)",
+        }
+        target = alias_map.get(target, target)
+        for i, m in enumerate(self.model_infos):
+            if m.name.strip().lower() == target:
+                return i
+        return None
+
+    # -------------------- Detection and status --------------------
+
     def on_text_changed(self):
-        """Update status when text changes"""
-        if self.delimiter_combo.currentText() == "Auto-detect":
-            content = self.csv_text.toPlainText().strip()
-            if content:
+        raw = self.csv_text.toPlainText().strip()
+        if not raw:
+            self.status_label.setText("")
+            return
+
+        directives = self.extract_directives(raw)
+        content = self.strip_directive_lines(raw)
+
+        # Apply #notetype directive
+        forced_model_info = None
+        nt_name = directives.get("notetype")
+        if nt_name:
+            idx = self.find_model_index_by_name(nt_name)
+            if idx is not None:
                 try:
-                    delimiter, rows = self.detect_csv_format(content)
-                    delim_name = self.get_delimiter_name(delimiter)
-                    self.status_label.setText(
-                        f"✓ Detected: {delim_name} delimiter, {rows} row(s)"
+                    self.notetype_combo.setCurrentIndex(idx)
+                    forced_model_info = (
+                        self.model_infos[idx].name,
+                        len(mw.col.models.get(self.model_infos[idx].id)["flds"])
                     )
-                except Exception as e:
-                    self.status_label.setText(f"⚠ Detection failed: {str(e)}")
-            else:
-                self.status_label.setText("")
+                except Exception:
+                    pass
+
+        # Delimiter detection
+        if self.delimiter_combo.currentText() == "Auto-detect":
+            try:
+                delimiter, rows = self.detect_csv_format(content)
+            except Exception as e:
+                self.status_label.setText(f"⚠ Detection failed: {str(e)}")
+                return
+        else:
+            delimiter = self.get_delimiter()
+            try:
+                reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+                rows = sum(1 for _ in reader)
+            except Exception:
+                rows = 0
+
+        delim_name = self.get_delimiter_name(delimiter)
+
+        # Note-type auto-pick if no directive
+        detected_model = None
+        if not forced_model_info:
+            detected_model = self.auto_pick_note_type(content, delimiter)
+
+        parts = []
+        parts.append(f"✓ Detected: {delim_name} delimiter")
+        parts.append(f"{rows} row(s)")
+        if forced_model_info:
+            model_name, field_count = forced_model_info
+            parts.append(f"Note type: {model_name} ({field_count} field(s), via directive)")
+        elif detected_model:
+            model_name, field_count = detected_model
+            parts.append(f"Note type: {model_name} ({field_count} field(s))")
+
+        self.status_label.setText(" • ".join(parts))
 
     def detect_csv_format(self, content):
         """
-        Auto-detect CSV delimiter and count rows
+        Auto-detect CSV delimiter and count rows.
         Returns: (delimiter, row_count)
         """
-        sample = content[:2048]  # Use first 2KB for detection
-        
-        # Try csv.Sniffer first
+        sample = content[:2048]
         try:
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(sample, delimiters=',;\t|')
             delimiter = dialect.delimiter
         except Exception:
-            # Fallback: count occurrences of common delimiters
             delimiter = self.fallback_delimiter_detection(sample)
-        
-        # Count rows
+
         reader = csv.reader(io.StringIO(content), delimiter=delimiter)
         rows = sum(1 for _ in reader)
-        
         return delimiter, rows
 
     def fallback_delimiter_detection(self, sample):
-        """
-        Fallback delimiter detection by counting occurrences
-        """
-        lines = sample.split('\n')[:5]  # Check first 5 lines
+        lines = sample.split('\n')[:5]
         if not lines:
             return ','
-        
         delimiters = [',', '\t', ';', '|']
         delimiter_counts = {}
-        
         for delim in delimiters:
-            # Count average occurrences per line
             counts = [line.count(delim) for line in lines if line.strip()]
             if counts:
                 avg = sum(counts) / len(counts)
-                # Check consistency (same count across lines)
                 if len(set(counts)) == 1 and counts[0] > 0:
-                    delimiter_counts[delim] = (avg, True)  # Consistent
+                    delimiter_counts[delim] = (avg, True)
                 elif avg > 0:
-                    delimiter_counts[delim] = (avg, False)  # Inconsistent
-        
-        # Prefer consistent delimiter with highest count
+                    delimiter_counts[delim] = (avg, False)
         if delimiter_counts:
             sorted_delims = sorted(
                 delimiter_counts.items(),
-                key=lambda x: (x[1][1], x[1][0]),  # Sort by (consistent, count)
-                reverse=True
+                key=lambda x: (x[1][1], x[1][0]),
+                reverse=True,
             )
             return sorted_delims[0][0]
-        
-        return ','  # Default to comma
+        return ','
 
     def get_delimiter_name(self, delimiter):
-        """Convert delimiter character to readable name"""
         names = {
             ',': 'Comma (,)',
             '\t': 'Tab',
@@ -218,20 +314,16 @@ class CSVPasteDialog(QDialog):
         return names.get(delimiter, f"'{delimiter}'")
 
     def get_delimiter(self):
-        """Get the delimiter based on selection or auto-detect"""
         selection = self.delimiter_combo.currentText()
-        
         if selection == "Auto-detect":
-            content = self.csv_text.toPlainText().strip()
+            content = self.strip_directive_lines(self.csv_text.toPlainText().strip())
             if content:
                 try:
                     delimiter, _ = self.detect_csv_format(content)
                     return delimiter
                 except Exception:
-                    return ','  # Fallback to comma
+                    return ','
             return ','
-        
-        # Manual selection
         mapping = {
             "Comma (,)": ",",
             "Tab": "\t",
@@ -239,6 +331,21 @@ class CSVPasteDialog(QDialog):
             "Pipe (|)": "|",
         }
         return mapping.get(selection, ',')
+
+    # -------------------- Subdeck helpers --------------------
+
+    def refresh_decks(self, select_name=None):
+        try:
+            self.deck_infos = list(mw.col.decks.all_names_and_ids())
+        except Exception:
+            self.deck_infos = []
+        self.deck_combo.clear()
+        names = [d.name for d in self.deck_infos]
+        self.deck_combo.addItems(names)
+        if select_name:
+            idx = self.deck_combo.findText(select_name)
+            if idx >= 0:
+                self.deck_combo.setCurrentIndex(idx)
 
     def _deck_id_from_index(self, i):
         if not self.deck_infos:
@@ -252,14 +359,126 @@ class CSVPasteDialog(QDialog):
         m = self.model_infos[i]
         return getattr(m, "id", None)
 
+    def create_subdeck(self):
+        parent_name = self.deck_combo.currentText().strip()
+        child = self.new_subdeck_edit.text().strip()
+        if not child:
+            showWarning("Enter a subdeck name first.")
+            return
+        child = re.sub(r"\s{2,}", " ", child)
+        full_name = f"{parent_name}::{child}"
+        try:
+            did = mw.col.decks.id(full_name)  # creates if missing
+            mw.col.decks.select(did)
+            self.refresh_decks(select_name=full_name)
+            self.new_subdeck_edit.clear()
+            self.status_label.setText(f"✓ Created subdeck: {full_name}")
+        except Exception as e:
+            showWarning(f"Could not create subdeck: {e}")
+
+    # -------------------- Note-type auto-pick --------------------
+
+    def normalize_name(self, s: str) -> str:
+        s = s.strip().lower()
+        s = re.sub(r'[\s_\-]+', ' ', s)
+        s = re.sub(r'[^a-z0-9 ]+', '', s)
+        return s
+
+    def auto_pick_note_type(self, content: str, delimiter: str):
+        try:
+            reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+            rows = [r for r in reader if any(c.strip() for c in r)]
+        except Exception:
+            rows = []
+        if not rows:
+            return None
+
+        header_hint = self.header_check.isChecked()
+        has_header_guess = False
+        try:
+            sniffer = csv.Sniffer()
+            has_header_guess = sniffer.has_header(content[:2048])
+        except Exception:
+            has_header_guess = False
+        has_header = header_hint or has_header_guess
+
+        header = [c.strip() for c in rows[0]] if has_header else None
+        sample_rows = rows[1:21] if has_header else rows[:20]
+        col_counts = [len(r) for r in sample_rows] or [len(rows[0])]
+        observed_cols = max(col_counts) if col_counts else len(rows[0])
+
+        try:
+            model_infos = list(mw.col.models.all_names_and_ids())
+        except Exception:
+            model_infos = []
+        if not model_infos:
+            return None
+
+        best = None
+        best_idx = None
+        best_name = None
+        best_fields = None
+        header_norm = [self.normalize_name(h) for h in (header or [])]
+
+        for idx, m in enumerate(model_infos):
+            try:
+                nt = mw.col.models.get(m.id)
+                field_names = [f["name"] for f in nt["flds"]]
+            except Exception:
+                continue
+
+            field_count = len(field_names)
+            fields_norm = [self.normalize_name(x) for x in field_names]
+
+            # name similarity
+            score_name = 0
+            if header_norm:
+                for h in header_norm:
+                    if not h:
+                        continue
+                    if h in fields_norm:
+                        score_name += 3
+                    else:
+                        if any(h in fn or fn in h for fn in fields_norm if fn):
+                            score_name += 1
+
+            # column closeness
+            diff = abs(observed_cols - field_count)
+            if diff == 0:
+                score_cols = 3
+            elif diff == 1:
+                score_cols = 2
+            elif diff == 2:
+                score_cols = 1
+            else:
+                score_cols = 0
+
+            score_tuple = (score_name, score_cols, -field_count)
+            if (best is None) or (score_tuple > best):
+                best = score_tuple
+                best_idx = idx
+                best_name = m.name
+                best_fields = field_count
+
+        if best_idx is None:
+            return None
+
+        try:
+            self.notetype_combo.setCurrentIndex(best_idx)
+        except Exception:
+            pass
+
+        return (best_name, best_fields)
+
+    # -------------------- Import actions --------------------
+
     def open_with_default_importer(self):
-        """Open Anki's standard import dialog with the pasted CSV"""
-        csv_content = self.csv_text.toPlainText().strip()
-        if not csv_content:
+        csv_raw = self.csv_text.toPlainText().strip()
+        if not csv_raw:
             showWarning("Please paste CSV content first.")
             return
 
-        # Select the target deck first so dialog picks sensible defaults
+        # Select deck for sane defaults
         deck_idx = self.deck_combo.currentIndex()
         deck_id = self._deck_id_from_index(deck_idx)
         if deck_id is not None:
@@ -268,7 +487,9 @@ class CSVPasteDialog(QDialog):
             except Exception:
                 pass
 
-        # Write to a temporary CSV file
+        csv_content = self.strip_directive_lines(csv_raw)
+
+        # Temp write and open Anki importer
         try:
             fd, path = tempfile.mkstemp(prefix="anki_csv_paste_", suffix=".csv", text=True)
             try:
@@ -282,25 +503,31 @@ class CSVPasteDialog(QDialog):
             showWarning(f"Could not create temp file: {e}")
             return
 
-        # Open Anki's default Import dialog with this file
         try:
             importFile(mw, path)
-            # Close our dialog since user will use Anki's import UI
             self.accept()
         except Exception as e:
             showWarning(f"Could not open import dialog: {e}")
-            # Clean up temp file on failure
             try:
                 os.unlink(path)
             except Exception:
                 pass
 
     def do_import(self):
-        """Quick import - directly add cards without showing Anki's import dialog"""
-        csv_content = self.csv_text.toPlainText().strip()
-        if not csv_content:
+        csv_raw = self.csv_text.toPlainText().strip()
+        if not csv_raw:
             showWarning("Please paste CSV content first.")
             return
+
+        # Re-apply directive at import time
+        directives = self.extract_directives(csv_raw)
+        nt_name = directives.get("notetype")
+        if nt_name:
+            idx = self.find_model_index_by_name(nt_name)
+            if idx is not None:
+                self.notetype_combo.setCurrentIndex(idx)
+
+        csv_content = self.strip_directive_lines(csv_raw)
 
         deck_idx = self.deck_combo.currentIndex()
         model_idx = self.notetype_combo.currentIndex()
@@ -323,16 +550,15 @@ class CSVPasteDialog(QDialog):
             delimiter = self.get_delimiter()
             reader = csv.reader(io.StringIO(csv_content), delimiter=delimiter)
             rows = [r for r in reader]
-            
+
             if not rows:
                 showWarning("No data rows found.")
                 return
-                
-            # Show delimiter info if auto-detected
+
             if self.delimiter_combo.currentText() == "Auto-detect":
                 delim_name = self.get_delimiter_name(delimiter)
                 self.status_label.setText(f"✓ Using {delim_name} delimiter")
-            
+
             if self.header_check.isChecked() and len(rows) > 1:
                 rows = rows[1:]
 
@@ -349,11 +575,10 @@ class CSVPasteDialog(QDialog):
 
                 note = mw.col.new_note(notetype)
 
-                # Fill fields
                 for i, val in enumerate(row[:len(field_names)]):
                     note.fields[i] = val.strip()
 
-                # Tags from last extra column
+                # Tags from last column (if extra)
                 if len(row) > len(field_names):
                     tags = row[-1].strip()
                     if tags:
@@ -363,13 +588,12 @@ class CSVPasteDialog(QDialog):
                 added += 1
 
             mw.reset()
-            
+
             msg = f"Import complete!\n\nAdded: {added} note(s)"
             if skipped_empty:
                 msg += f"\nSkipped empty rows: {skipped_empty}"
             if self.delimiter_combo.currentText() == "Auto-detect":
                 msg += f"\n\nUsed delimiter: {self.get_delimiter_name(delimiter)}"
-                
             showInfo(msg)
             self.accept()
 

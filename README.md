@@ -1,4 +1,4 @@
-[Below is a ready-to-paste README.md for the add‑on.[11][12]](https://ankiweb.net/shared/info/202309288?cb=1761457955958)
+https://ankiweb.net/shared/info/202309288?cb=1761457955958
 
 # CSV Paste Import (Anki add‑on)[12][11]
 

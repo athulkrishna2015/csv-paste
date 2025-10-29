@@ -1,8 +1,8 @@
 Depricated use [csv import plus](https://github.com/athulkrishna2015/csv-import-plus)
 
-https://ankiweb.net/shared/info/202309288?cb=1761457955958
 
-# CSV Paste Import (Anki add‑on)[12][11]
+
+# [CSV Paste Import ](https://ankiweb.net/shared/info/202309288?cb=1761457955958)(Anki add‑on)[12][11]
 
 Paste CSV directly into a dialog to create notes with automatic delimiter detection, optional header handling, note‑type selection by directive or smart matching, and a one‑click subdeck creator.[11][12]
 

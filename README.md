@@ -1,3 +1,5 @@
+Depricated use [csv import plus](https://github.com/athulkrishna2015/csv-import-plus)
+
 https://ankiweb.net/shared/info/202309288?cb=1761457955958
 
 # CSV Paste Import (Anki add‑on)[12][11]
